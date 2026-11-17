@@ -1,6 +1,6 @@
 # insta360_ros_driver
 
-A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu 22.04 with ROS2 Humble. The driver has also been verified on the Insta360 X2 and X3 cameras. The following resolutions are available, all at 30 FPS.
+A ROS driver for the Insta360 cameras. This driver is tested on Ubuntu *24.04 with ROS2 Jazzy*. The driver has also been verified on the Insta360 X2 and X3 cameras. *We also test with the Insta360 X4 Air, at least for publishing fisheye and equirectangular images within ROS2 framework.* The following resolutions are available, all at 30 FPS.
 - 3840 x 1920
 - 2560 x 1280
 - 2304 x 1152

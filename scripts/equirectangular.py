@@ -8,8 +8,6 @@ from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 import math
 from rcl_interfaces.msg import SetParametersResult
 
@@ -29,7 +27,7 @@ class EquirectangularNode(Node):
                 ('crop_size', 960),
                 ('translation', [0.0, 0.0, -0.105]),
                 ('rotation_deg', [-0.5, 0.0, 1.1]),
-                ('gpu', True),
+                ('gpu', False),
                 ('out_width', 1920),
                 ('out_height', 960)
             ]
@@ -38,10 +36,10 @@ class EquirectangularNode(Node):
         # Load parameters from ROS parameter server
         self.load_parameters()
         
-        # Initialize GPU settings
-        self.use_cuda = torch.cuda.is_available() and getattr(self, 'gpu_enabled', True)
-        self.get_logger().info(f"GPU acceleration: requested={getattr(self, 'gpu_enabled', True)}, available={torch.cuda.is_available()}, using={self.use_cuda}")
-        self.device = torch.device('cuda' if self.use_cuda else 'cpu')
+        # CPU-only implementation: projection and remapping use NumPy/OpenCV.
+        self.use_cuda = False
+        if self.gpu_enabled:
+            self.get_logger().warn("GPU acceleration is unavailable in this CPU-only version; using CPU.")
 
         self.calibration_mode = enable_calibration
         self.maps_initialized = False
@@ -59,21 +57,14 @@ class EquirectangularNode(Node):
         self.original_back_img: np.ndarray | None = None
 
         # Precomputed masks and kernels
-        self.front_mask: torch.Tensor | None = None
-        self.back_mask: torch.Tensor | None = None
+        self.front_mask: np.ndarray | None = None
+        self.back_mask: np.ndarray | None = None
         self.front_mask_np: np.ndarray | None = None
         self.back_mask_np: np.ndarray | None = None
         self.blend_kernel: np.ndarray = np.ones((5, 5), np.uint8)
         self.front_edge: np.ndarray | None = None
         self.front_distance: np.ndarray | None = None
 
-        # GPU specific masks and grids
-        self.front_grid: torch.Tensor | None = None
-        self.back_grid: torch.Tensor | None = None
-        self.front_mask_gpu: torch.Tensor | None = None
-        self.back_mask_gpu: torch.Tensor | None = None
-        self.edge_mask_gpu: torch.Tensor | None = None
-        self.blend_weight_gpu: torch.Tensor | None = None
         
         self.add_on_set_parameters_callback(self.parameters_callback)
         self.update_camera_parameters() # Initialize camera parameters
@@ -119,11 +110,11 @@ class EquirectangularNode(Node):
             self.get_logger().info(f"  Translation: [{self.tx}, {self.ty}, {self.tz}]")
             self.get_logger().info(f"  Rotation (deg): {rotation_deg}")
             self.get_logger().info(f"  Output size: {self.out_width}x{self.out_height}")
-            self.get_logger().info(f"  GPU enabled: {self.gpu_enabled}")
+            self.get_logger().info("  Processing backend: CPU (NumPy/OpenCV)")
         except Exception as e:
             self.get_logger().error(f"Error loading parameters: {e}")
             # Set defaults if parameter loading fails
-            self.gpu_enabled = True
+            self.gpu_enabled = False
             raise
     
     def save_calibration(self):
@@ -196,146 +187,129 @@ class EquirectangularNode(Node):
         cv2.setTrackbarPos("Yaw [-180°,180°]", self.control_window, int(math.degrees(self.yaw) * 10) + 1800)
 
     def update_camera_parameters(self):
-        # Build rotation matrix using current parameters
-        Rx = torch.tensor([
+        """Build the back-to-front rotation and translation using NumPy."""
+        cr, sr = math.cos(self.roll), math.sin(self.roll)
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
+
+        Rx = np.array([
             [1.0, 0.0, 0.0],
-            [0.0, math.cos(self.roll), -math.sin(self.roll)],
-            [0.0, math.sin(self.roll), math.cos(self.roll)]
-        ], device=self.device)
-        
-        Ry = torch.tensor([
-            [math.cos(self.pitch), 0.0, math.sin(self.pitch)],
+            [0.0, cr, -sr],
+            [0.0, sr, cr]
+        ], dtype=np.float32)
+
+        Ry = np.array([
+            [cp, 0.0, sp],
             [0.0, 1.0, 0.0],
-            [-math.sin(self.pitch), 0.0, math.cos(self.pitch)]
-        ], device=self.device)
-        
-        Rz = torch.tensor([
-            [math.cos(self.yaw), -math.sin(self.yaw), 0.0],
-            [math.sin(self.yaw), math.cos(self.yaw), 0.0],
+            [-sp, 0.0, cp]
+        ], dtype=np.float32)
+
+        Rz = np.array([
+            [cy, -sy, 0.0],
+            [sy, cy, 0.0],
             [0.0, 0.0, 1.0]
-        ], device=self.device)
-        
-        self.back_to_front_rotation = torch.matmul(torch.matmul(Rz, Ry), Rx)
-        self.back_to_front_translation = torch.tensor([self.tx, self.ty, self.tz], device=self.device)
-        
+        ], dtype=np.float32)
+
+        self.back_to_front_rotation = Rz @ Ry @ Rx
+        self.back_to_front_translation = np.array(
+            [self.tx, self.ty, self.tz], dtype=np.float32
+        )
+
         if self.maps_initialized and not self.calibration_mode:
             self.maps_initialized = False
             self.get_logger().info("Parameters updated, remapping will occur on next image")
 
     def init_mapping(self, img_height: int, img_width: int):
-        """Initialize mapping matrices for equirectangular projection."""
+        """Initialize equirectangular projection maps using NumPy (CPU)."""
         if self.out_width is None or self.out_height is None:
-            self.get_logger().error("Output dimensions (out_width, out_height) are not set. Cannot initialize mapping.")
+            self.get_logger().error("Output dimensions are not set. Cannot initialize mapping.")
             return
 
-        self.get_logger().info(f"Initializing equirectangular projection: fusing two {img_width}x{img_height} fisheye images to {self.out_width}x{self.out_height}")
-        
+        self.get_logger().info(
+            f"Initializing equirectangular projection: fusing two "
+            f"{img_width}x{img_height} fisheye images to "
+            f"{self.out_width}x{self.out_height}"
+        )
+
         self.img_height = img_height
         self.img_width = img_width
-        
         self.cx = img_width / 2 + self.cx_offset
         self.cy = img_height / 2 + self.cy_offset
-        
-        y, x = torch.meshgrid(
-            torch.arange(self.out_height, dtype=torch.float32, device=self.device),
-            torch.arange(self.out_width, dtype=torch.float32, device=self.device),
+
+        y, x = np.meshgrid(
+            np.arange(self.out_height, dtype=np.float32),
+            np.arange(self.out_width, dtype=np.float32),
             indexing='ij'
         )
-        
+
         longitude = (x / self.out_width) * 2 * math.pi - math.pi
         latitude = (y / self.out_height) * math.pi - math.pi / 2
-        
-        X = torch.cos(latitude) * torch.sin(longitude)
-        Y = torch.sin(latitude)
-        Z = torch.cos(latitude) * torch.cos(longitude)
-        
-        self.front_mask = (Z >= 0)
-        self.back_mask = (Z < 0)
-        
-        self.front_mask_np = self.front_mask.cpu().numpy()
-        self.back_mask_np = self.back_mask.cpu().numpy()
-        
-        r_front = torch.sqrt(X[self.front_mask]**2 + Y[self.front_mask]**2).clamp_(min=1e-6)
-        theta_front = torch.atan2(r_front, torch.abs(Z[self.front_mask]))
+
+        X = np.cos(latitude) * np.sin(longitude)
+        Y = np.sin(latitude)
+        Z = np.cos(latitude) * np.cos(longitude)
+
+        self.front_mask = Z >= 0
+        self.back_mask = Z < 0
+        self.front_mask_np = self.front_mask
+        self.back_mask_np = self.back_mask
+
+        # Front fisheye projection
+        r_front = np.maximum(
+            np.sqrt(X[self.front_mask] ** 2 + Y[self.front_mask] ** 2),
+            1e-6
+        )
+        theta_front = np.arctan2(r_front, np.abs(Z[self.front_mask]))
         r_fisheye_front = 2 * theta_front / math.pi * (self.img_width / 2)
-        
-        self.front_map_x = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
-        self.front_map_y = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
-        
-        self.front_map_x[self.front_mask] = self.cx + X[self.front_mask] / r_front * r_fisheye_front
-        self.front_map_y[self.front_mask] = self.cy + Y[self.front_mask] / r_front * r_fisheye_front
-        
-        back_X_tensor = X[self.back_mask]
-        back_Y_tensor = Y[self.back_mask]
-        back_Z_tensor = Z[self.back_mask]
-        
-        back_points = torch.stack([back_X_tensor, back_Y_tensor, back_Z_tensor], dim=1)
-        
-        rotation = self.back_to_front_rotation.to(dtype=torch.float32)
-        translation = self.back_to_front_translation.to(dtype=torch.float32)
-        
-        transformed_points = torch.matmul(back_points, rotation.transpose(0, 1)) + translation
-        
+
+        self.front_map_x_np = np.zeros((self.out_height, self.out_width), dtype=np.float32)
+        self.front_map_y_np = np.zeros((self.out_height, self.out_width), dtype=np.float32)
+        self.front_map_x_np[self.front_mask] = (
+            self.cx + X[self.front_mask] / r_front * r_fisheye_front
+        )
+        self.front_map_y_np[self.front_mask] = (
+            self.cy + Y[self.front_mask] / r_front * r_fisheye_front
+        )
+
+        # Back fisheye projection, transformed into the front camera frame
+        back_points = np.stack(
+            [X[self.back_mask], Y[self.back_mask], Z[self.back_mask]], axis=1
+        )
+        transformed_points = (
+            back_points @ self.back_to_front_rotation.T
+            + self.back_to_front_translation
+        )
+
         X_back = -transformed_points[:, 0]
         Y_back = transformed_points[:, 1]
         Z_back = transformed_points[:, 2]
-        
-        r_back = torch.sqrt(X_back**2 + Y_back**2).clamp_(min=1e-6)
-        theta_back = torch.atan2(r_back, torch.abs(Z_back))
+
+        r_back = np.maximum(np.sqrt(X_back ** 2 + Y_back ** 2), 1e-6)
+        theta_back = np.arctan2(r_back, np.abs(Z_back))
         r_fisheye_back = 2 * theta_back / math.pi * (self.img_width / 2)
-        
-        self.back_map_x = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
-        self.back_map_y = torch.zeros((self.out_height, self.out_width), dtype=torch.float32, device=self.device)
 
-        self.back_map_x[self.back_mask] = self.cx + X_back / r_back * r_fisheye_back
-        self.back_map_y[self.back_mask] = self.cy + Y_back / r_back * r_fisheye_back
+        self.back_map_x_np = np.zeros((self.out_height, self.out_width), dtype=np.float32)
+        self.back_map_y_np = np.zeros((self.out_height, self.out_width), dtype=np.float32)
+        self.back_map_x_np[self.back_mask] = (
+            self.cx + X_back / r_back * r_fisheye_back
+        )
+        self.back_map_y_np[self.back_mask] = (
+            self.cy + Y_back / r_back * r_fisheye_back
+        )
 
-        self.front_map_x_np = self.front_map_x.cpu().numpy()
-        self.front_map_y_np = self.front_map_y.cpu().numpy()
-        self.back_map_x_np = self.back_map_x.cpu().numpy()
-        self.back_map_y_np = self.back_map_y.cpu().numpy()
-        
-        if self.front_mask_np is not None:
-            front_mask_uint8 = self.front_mask_np.astype(np.uint8)
-            self.front_edge = cv2.dilate(front_mask_uint8, self.blend_kernel, iterations=2) - \
-                              cv2.erode(front_mask_uint8, self.blend_kernel, iterations=2)
-            self.front_distance = cv2.distanceTransform(front_mask_uint8, cv2.DIST_L2, 3)
-            self.front_distance = np.clip(self.front_distance * 0.3, 0, 1)
-        
+        front_mask_uint8 = self.front_mask_np.astype(np.uint8)
+        self.front_edge = (
+            cv2.dilate(front_mask_uint8, self.blend_kernel, iterations=2)
+            - cv2.erode(front_mask_uint8, self.blend_kernel, iterations=2)
+        )
+        self.front_distance = cv2.distanceTransform(
+            front_mask_uint8, cv2.DIST_L2, 3
+        )
+        self.front_distance = np.clip(self.front_distance * 0.3, 0, 1)
+
         self.maps_initialized = True
-
-        if self.use_cuda:
-            try:
-                if self.img_width is None or self.img_height is None: 
-                    self.get_logger().error("Image dimensions (img_width, img_height) are None. Cannot initialize GPU grids.")
-                    self.use_cuda = False
-                else:
-                    front_map_x_norm = 2.0 * (self.front_map_x / self.img_width) - 1.0
-                    front_map_y_norm = 2.0 * (self.front_map_y / self.img_height) - 1.0
-                    self.front_grid = torch.stack([front_map_x_norm, front_map_y_norm], dim=-1).unsqueeze(0)
-                    
-                    back_map_x_norm = 2.0 * (self.back_map_x / self.img_width) - 1.0
-                    back_map_y_norm = 2.0 * (self.back_map_y / self.img_height) - 1.0
-                    self.back_grid = torch.stack([back_map_x_norm, back_map_y_norm], dim=-1).unsqueeze(0)
-                    
-                    if self.front_mask is not None:
-                        self.front_mask_gpu = self.front_mask.float().unsqueeze(0).unsqueeze(0)
-                    if self.back_mask is not None:
-                        self.back_mask_gpu = self.back_mask.float().unsqueeze(0).unsqueeze(0)
-                    
-                    # GPU edge and blend masks
-                    if self.front_edge is not None:
-                        self.edge_mask_gpu = torch.from_numpy(self.front_edge.astype(np.float32)).to(self.device, non_blocking=True).unsqueeze(0).unsqueeze(0)
-                    if self.front_distance is not None:
-                        self.blend_weight_gpu = torch.from_numpy(self.front_distance.astype(np.float32)).to(self.device, non_blocking=True).unsqueeze(0).unsqueeze(0)
-                    
-                    self.get_logger().info("GPU acceleration resources initialized successfully")
-
-            except Exception as e:
-                self.use_cuda = False
-                self.get_logger().error(f"Error initializing GPU acceleration resources, falling back to CPU: {e}")
-        
-        self.get_logger().info(f"Mapping matrices initialization complete (GPU: {self.use_cuda})")
+        self.use_cuda = False
+        self.get_logger().info("Mapping matrices initialization complete (CPU)")
 
     def image_callback(self, dual_fisheye_msg: Image):
         """Process the dual fisheye image to create equirectangular image"""
@@ -394,17 +368,9 @@ class EquirectangularNode(Node):
                     self.params_changed = False
             
             start_time = self.get_clock().now()
-            if self.use_cuda and self.maps_initialized:
-                try:
-                    equirect_img = self.create_equirectangular_gpu(front_img, back_img)
-                except Exception as e:
-                    self.get_logger().warn(f"GPU processing error: {e}, falling back to CPU")
-                    self.use_cuda = False
-                    equirect_img = self.create_equirectangular(front_img, back_img)
-            else:
-                if not self.maps_initialized:
-                    self.get_logger().warn("Maps not initialized, attempting CPU processing with on-the-fly init.")
-                equirect_img = self.create_equirectangular(front_img, back_img)
+            if not self.maps_initialized:
+                self.get_logger().warn("Maps not initialized, attempting CPU processing with on-the-fly init.")
+            equirect_img = self.create_equirectangular(front_img, back_img)
             
             equirect_msg = self.bridge.cv2_to_imgmsg(equirect_img, encoding="rgb8")
             equirect_msg.header = dual_fisheye_msg.header
@@ -460,40 +426,6 @@ class EquirectangularNode(Node):
         
         return equirect
     
-    def create_equirectangular_gpu(self, front_img: np.ndarray, back_img: np.ndarray) -> np.ndarray:
-        """Create equirectangular image using GPU acceleration."""
-        if not self.use_cuda:
-            self.get_logger().warn("GPU processing called but not enabled/initialized. Falling back to CPU.")
-            return self.create_equirectangular(front_img, back_img)
-
-        if not self.maps_initialized or self.params_changed or \
-           (self.img_height is not None and front_img.shape[0] != self.img_height) or \
-           (self.img_width is not None and front_img.shape[1] != self.img_width):
-            self.init_mapping(front_img.shape[0], front_img.shape[1])
-            self.params_changed = False
-        
-        if not self.maps_initialized or self.front_grid is None or self.back_grid is None or \
-           self.front_mask_gpu is None or self.back_mask_gpu is None or \
-           self.out_height is None or self.out_width is None:
-            self.get_logger().error("GPU grids or masks not initialized. Falling back to CPU processing.")
-            self.use_cuda = False 
-            return self.create_equirectangular(front_img, back_img)
-
-        front_tensor = torch.from_numpy(front_img).to(self.device, non_blocking=True).float().permute(2, 0, 1).unsqueeze(0)
-        back_tensor = torch.from_numpy(back_img).to(self.device, non_blocking=True).float().permute(2, 0, 1).unsqueeze(0)
-        
-        front_remapped = F.grid_sample(front_tensor, self.front_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-        back_remapped = F.grid_sample(back_tensor, self.back_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-        
-        if front_remapped.shape[2:] != (self.out_height, self.out_width):
-            front_remapped = F.interpolate(front_remapped, size=(self.out_height, self.out_width), mode='bilinear', align_corners=True)
-        if back_remapped.shape[2:] != (self.out_height, self.out_width):
-            back_remapped = F.interpolate(back_remapped, size=(self.out_height, self.out_width), mode='bilinear', align_corners=True)
-        
-        output = front_remapped * self.front_mask_gpu + back_remapped * self.back_mask_gpu
-        
-        output_np = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        return np.clip(output_np, 0, 255).astype(np.uint8)
 
     def setup_calibration_ui(self):
         """Set up UI for calibration mode"""

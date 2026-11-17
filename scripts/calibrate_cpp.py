@@ -40,8 +40,8 @@ class CppCalibrationClient(Node):
         self.create_slider('Yaw [-180,180]', self.values['rotation_deg'][2] * 10 + 1800, 3600, 'yaw')
 
     def read_parameters(self):
-        values = {'cx_offset': 0.0, 'cy_offset': 0.0, 'crop_size': 0,
-                  'translation': [0.0, 0.0, -0.105], 'rotation_deg': [-0.5, 0.0, 1.1]}
+        values = {'cx_offset': 0.0, 'cy_offset': 0.0, 'crop_size': 960,
+                  'translation': [500.0, 500.0, 395.0], 'rotation_deg': [1795.0, 1800.0, 1811.0]}
         client = self.create_client(GetParameters, f'/{self.target_node}/get_parameters')
         if not client.wait_for_service(timeout_sec=2.0):
             return values

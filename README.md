@@ -13,15 +13,15 @@ To use this driver, you need to first have Insta360 SDK. Please apply for the SD
 
 For additional instructions, see this [post](https://github.com/ai4ce/insta360_ros_driver/issues/10#issuecomment-3371481987).
 
-**Note: Please make sure you use the latest SDK**
+**Note: Please make sure you use the CameraSDK-2.2.4-20261104_140905-linux-x86_64**
 
 ```
 cd ~/ros2_ws/src
 git clone -b humble https://github.com/ai4ce/insta360_ros_driver
 cd ..
 ```
-Then, the Insta360 libraries need to be installed as follows:
-- add the <code>camera</code> and <code>stream</code> header files inside the <code>include</code> directory
+Then, the Insta360 SDK libraries need to be installed as follows: 
+- add the folders <code>camera</code> and <code>stream</code> with their files inside the <code>include</code> directory of this cloned repository.
 - add the <code>libCameraSDK.so</code> library under the <code>lib</code> directory.
 
 
